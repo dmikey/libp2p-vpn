@@ -2,14 +2,16 @@ package main
 
 import (
 	"context"
-	"flag" // Added import
+	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/libp2p/go-libp2p"
@@ -103,16 +105,39 @@ func configureTunDevice(ifaceName, ipNet, subnet string) error { // Added subnet
 	return nil
 }
 
+// Global routing table and exit node info
+var (
+	peerRoutingTable = make(map[string]peer.ID)
+	routingTableLock sync.RWMutex
+	exitNodePeerID   peer.ID
+	localVPNIP       string
+)
+
 func main() {
 	// Define command-line flags
 	discoveryTag := flag.String("tag", "p2p-vpn-example", "Unique discovery tag for the VPN service")
 	vpnSubnet := flag.String("subnet", "10.0.8.0/24", "Subnet for the VPN network (e.g., 10.0.8.0/24)")
 	localVPNIPNet := flag.String("ip", "10.0.8.1/24", "Local IP address for this node within the VPN subnet (e.g., 10.0.8.1/24)")
+	exitNodeStr := flag.String("exitnode", "", "Optional Peer ID of the exit node for non-VPN traffic") // Added exit node flag
 
 	flag.Parse() // Parse the flags
 
-	ctx := context.Background()
-	// Removed hardcoded vpnSubnet and localVPNIP
+	// Extract local IP from CIDR
+	ip, _, err := net.ParseCIDR(*localVPNIPNet)
+	if err != nil {
+		log.Fatalf("Invalid local VPN IP format: %v", err)
+	}
+	localVPNIP = ip.String() // Store the local IP
+
+	// Parse Exit Node Peer ID if provided
+	if *exitNodeStr != "" {
+		var err error
+		exitNodePeerID, err = peer.Decode(*exitNodeStr)
+		if err != nil {
+			log.Fatalf("Invalid exit node Peer ID: %v", err)
+		}
+		log.Printf("Using exit node: %s", exitNodePeerID.String())
+	}
 
 	tunIface, err := setupTun()
 	if err != nil {
@@ -138,66 +163,129 @@ func main() {
 	}
 
 	node.SetStreamHandler("/vpn/1.0.0", func(s network.Stream) {
+		// TODO: Implement a mechanism for peers to announce their VPN IP
+		// when a connection/stream is established. This is needed to populate
+		// the peerRoutingTable.
+		// Example: Read the first message, expect it to be the peer's VPN IP,
+		// then add it to the table.
+		// routingTableLock.Lock()
+		// peerRoutingTable[remotePeerVPNIP] = s.Conn().RemotePeer()
+		// routingTableLock.Unlock()
+
 		go func() {
 			defer s.Close()
-			buf := make([]byte, 2000)
+			buf := make([]byte, 2000) // MTU size buffer
 			for {
 				n, err := s.Read(buf)
 				if err != nil {
-					return
+					// Log read errors, e.g., stream closed, reset
+					// log.Printf("Error reading from stream peer %s: %v", s.Conn().RemotePeer(), err)
+					return // Exit goroutine on error
 				}
-				// TODO: Implement routing logic here.
-				// Before writing to TUN, check if the destination IP in the packet
-				// belongs to the local node's VPN IP. If not, forward it
-				// to the appropriate peer based on a routing table.
-				// For now, we assume all traffic is for the local TUN.
+
+				// Basic check: Ensure packet has at least an IPv4 header (20 bytes)
+				if n < 20 {
+					log.Printf("Received runt packet from %s, size %d, discarding", s.Conn().RemotePeer(), n)
+					continue
+				}
+
+				// Optimization: Check destination IP. If it's not localVPNIP,
+				// this node might be acting as a relay. For now, we assume
+				// packets arriving via stream are destined for the local TUN.
+				// More complex routing (peer -> peer via relay) is not handled here.
+
+				// Write packet received from peer to the local TUN interface
 				_, err = tunIface.Write(buf[:n])
 				if err != nil {
-					log.Printf("Error writing to TUN: %v", err)
+					log.Printf("Error writing to TUN from peer %s: %v", s.Conn().RemotePeer(), err)
+					// Decide if we should continue or return based on the error
 				}
 			}
 		}()
 	})
 
 	go func() {
-		buf := make([]byte, 2000)
+		buf := make([]byte, 2000) // MTU size buffer
 		for {
 			n, err := tunIface.Read(buf)
 			if err != nil {
 				log.Println("Error reading TUN:", err)
+				continue // Continue reading after error
+			}
+			if n == 0 {
+				continue // Skip empty packets
+			}
+
+			packetData := buf[:n]
+
+			// Basic check: Ensure packet has at least an IPv4 header (20 bytes)
+			if n < 20 {
+				log.Printf("Read runt packet from TUN, size %d, discarding", n)
 				continue
 			}
 
-			// TODO: Implement routing logic here.
-			// Read the destination IP from the packet header (buf[:n]).
-			// Determine which peer corresponds to that destination IP.
-			// This requires a mechanism for peers to share their assigned VPN IPs.
-			// For now, broadcast to all connected peers.
+			// --- Packet Forwarding Logic ---
+			// Parse destination IP (IPv4 header: bytes 16-19)
+			destIP := net.IP(packetData[16:20])
+			destIPStr := destIP.String()
 
-			packetData := buf[:n] // Keep a copy of the packet data
+			// If destination is self, skip forwarding (kernel handles it)
+			if destIPStr == localVPNIP {
+				// log.Printf("Packet destined for local node %s, skipping forwarding", localVPNIP)
+				continue
+			}
 
-			for _, p := range node.Peerstore().Peers() {
-				if p == node.ID() {
+			var targetPeer peer.ID
+			var found bool
+
+			// 1. Check routing table for specific peer
+			routingTableLock.RLock()
+			targetPeer, found = peerRoutingTable[destIPStr]
+			routingTableLock.RUnlock()
+
+			if found {
+				// log.Printf("Forwarding packet to specific peer %s for IP %s", targetPeer, destIPStr)
+			} else if exitNodePeerID != "" {
+				// 2. If not found, check if an exit node is configured
+				targetPeer = exitNodePeerID
+				found = true // Mark as found to proceed with forwarding
+				// log.Printf("Forwarding packet for IP %s to exit node %s", destIPStr, targetPeer)
+			}
+
+			// 3. Forward if a target (specific peer or exit node) was found
+			if found {
+				if targetPeer == node.ID() { // Avoid sending to self
 					continue
 				}
-				stream, err := node.NewStream(ctx, p, "/vpn/1.0.0")
+				stream, err := node.NewStream(context.Background(), targetPeer, "/vpn/1.0.0")
 				if err != nil {
-					log.Println("Stream error:", err)
-					continue
+					log.Printf("Failed to open stream to target peer %s for IP %s: %v", targetPeer, destIPStr, err)
+					continue // Try next packet
 				}
-				// Write the original packet data
+
 				_, err = stream.Write(packetData)
 				if err != nil {
-					log.Println("Write error:", err)
-					stream.Reset() // Reset stream on write error
+					log.Printf("Error writing packet to peer %s for IP %s: %v", targetPeer, destIPStr, err)
+					stream.Reset()
 				} else {
-					stream.CloseWrite() // Close the write side gracefully
+					stream.CloseWrite() // Gracefully close write side
 				}
-				// It's generally better practice to handle stream closure
-				// after ensuring data is sent or an error occurred.
-				// Closing immediately might cut off transmission.
-				// stream.Close() // Removed immediate close
+				// stream.Close() // Close might be too soon, CloseWrite is better
+			} else {
+				// 4. Destination unknown and no exit node
+				log.Printf("No route for destination IP %s, dropping packet", destIPStr)
 			}
+
+			// --- End Packet Forwarding Logic ---
+
+			// Remove the old broadcast logic:
+			/*
+				for _, p := range node.Peerstore().Peers() {
+					if p == node.ID() {
+						continue
+					}
+					// ... old stream opening and writing ...
+			*/
 		}
 	}()
 
