@@ -2,13 +2,14 @@ package main
 
 import (
 	"context"
+	"flag" // Added import
 	"fmt"
 	"log"
 	"os"
-	"os/exec" // Added import
+	"os/exec"
 	"os/signal"
-	"runtime" // Added import
-	"strings" // Added import
+	"runtime"
+	"strings"
 	"syscall"
 
 	"github.com/libp2p/go-libp2p"
@@ -103,9 +104,15 @@ func configureTunDevice(ifaceName, ipNet, subnet string) error { // Added subnet
 }
 
 func main() {
+	// Define command-line flags
+	discoveryTag := flag.String("tag", "p2p-vpn-example", "Unique discovery tag for the VPN service")
+	vpnSubnet := flag.String("subnet", "10.0.8.0/24", "Subnet for the VPN network (e.g., 10.0.8.0/24)")
+	localVPNIPNet := flag.String("ip", "10.0.8.1/24", "Local IP address for this node within the VPN subnet (e.g., 10.0.8.1/24)")
+
+	flag.Parse() // Parse the flags
+
 	ctx := context.Background()
-	vpnSubnet := "10.0.8.0/24"  // Define the VPN subnet
-	localVPNIP := "10.0.8.1/24" // Assign the first IP to this node
+	// Removed hardcoded vpnSubnet and localVPNIP
 
 	tunIface, err := setupTun()
 	if err != nil {
@@ -113,8 +120,8 @@ func main() {
 	}
 	log.Println("TUN device created:", tunIface.Name())
 
-	// Configure the TUN device IP and routes
-	if err := configureTunDevice(tunIface.Name(), localVPNIP, vpnSubnet); err != nil { // Pass vpnSubnet
+	// Configure the TUN device IP and routes using flag values
+	if err := configureTunDevice(tunIface.Name(), *localVPNIPNet, *vpnSubnet); err != nil { // Use flag values
 		log.Fatalf("Error configuring TUN device: %v", err)
 	}
 
@@ -124,7 +131,8 @@ func main() {
 	}
 
 	notifee := &discoveryNotifee{h: node}
-	srv := mdns.NewMdnsService(node, discoveryServiceTag, notifee)
+	// Use flag value for discovery tag
+	srv := mdns.NewMdnsService(node, *discoveryTag, notifee)
 	if err := srv.Start(); err != nil {
 		log.Fatal(err)
 	}
