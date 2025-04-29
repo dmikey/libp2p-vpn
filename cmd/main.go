@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio" // Added import
 	"context"
 	"flag"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time" // Added for potential timeouts/retries
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/host"
@@ -29,9 +31,31 @@ type discoveryNotifee struct {
 }
 
 func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
-	log.Println("Found peer:", pi.ID.String())
+	// Log regardless of whether it's the exit node or not
+	log.Printf("mDNS Found peer: %s with %d addresses", pi.ID.String(), len(pi.Addrs))
+
+	// Check if the found peer is the configured exit node
+	isExitNode := exitNodePeerID != "" && pi.ID == exitNodePeerID
+	if isExitNode {
+		log.Printf(">>> Discovered configured Exit Node: %s", pi.ID.String())
+	}
+
+	// Check if we already have addresses for this peer in the peerstore
 	if len(n.h.Peerstore().Addrs(pi.ID)) == 0 {
-		n.h.Connect(context.Background(), pi)
+		log.Printf("Peerstore has no addresses for %s, attempting connection to populate.", pi.ID.String())
+		// Attempt to connect to the newly found peer to populate addresses
+		err := n.h.Connect(context.Background(), pi)
+		if err != nil {
+			log.Printf("Failed to connect to newly found peer %s: %v", pi.ID.String(), err)
+		} else {
+			log.Printf("Successfully connected to %s (addresses should now be in peerstore)", pi.ID.String())
+			if isExitNode {
+				log.Printf(">>> Successfully connected to Exit Node: %s", pi.ID.String())
+			}
+		}
+	} else {
+		// Optional: Log if the peer was found again but we already knew its addresses
+		// log.Printf("Peer %s found by mDNS, but addresses already known in peerstore.", pi.ID.String())
 	}
 }
 
@@ -105,22 +129,158 @@ func configureTunDevice(ifaceName, ipNet, subnet string) error { // Added subnet
 	return nil
 }
 
-// Global routing table and exit node info
+// Global routing table, exit node info, role, subnet info, and stream management
 var (
 	peerRoutingTable = make(map[string]peer.ID)
 	routingTableLock sync.RWMutex
 	exitNodePeerID   peer.ID
 	localVPNIP       string
+	nodeRole         string     // Added: "user" or "exitnode"
+	vpnSubnetCIDR    *net.IPNet // Added: Parsed VPN subnet
+
+	// Map to store active outgoing streams to peers
+	peerStreams = make(map[peer.ID]network.Stream)
+	streamLock  sync.Mutex
 )
+
+const (
+	roleUser     = "user"
+	roleExitNode = "exitnode"
+)
+
+// getOrCreateStream finds an existing stream to the target peer or creates a new one.
+// Performs handshake for new streams. Returns nil if a stream cannot be established.
+func getOrCreateStream(ctx context.Context, node host.Host, targetPeer peer.ID) network.Stream {
+	streamLock.Lock()
+	stream, ok := peerStreams[targetPeer]
+	streamLock.Unlock()
+
+	if ok {
+		// TODO: Add a check here to see if the stream is still valid?
+		// Simplest check: try a zero-byte write or check stats if available.
+		// For now, assume it's valid; if subsequent writes fail, it will be removed then.
+		log.Printf("Reusing existing stream to %s (Stream ID: %s)", targetPeer, stream.ID()) // Added log
+		return stream
+	}
+
+	// --- Check if we know the peer's addresses before trying to open a stream ---
+	peerAddrs := node.Peerstore().Addrs(targetPeer) // Get addresses
+	if len(peerAddrs) == 0 {                        // Check length
+		log.Printf("Cannot open stream: No known addresses for peer %s. Discovery might be pending.", targetPeer)
+		// Don't attempt node.Connect here, let discovery handle the initial connection.
+		return nil // Indicate failure to establish stream for now
+	}
+	// --- End address check ---
+
+	// No existing stream, create a new one
+	// Log the addresses we know for debugging
+	log.Printf("Attempting to open NEW stream to %s (addresses known)", targetPeer) // Modified log
+	newStream, err := node.NewStream(ctx, targetPeer, "/vpn/1.0.0")                 // Use new variable name
+	if err != nil {
+		// Log the specific error from NewStream
+		log.Printf("Failed to open new stream to target %s: %v", targetPeer, err)
+		// Check if the error is due to lack of addresses again, although the check above should prevent this.
+		if strings.Contains(err.Error(), "no addresses") {
+			log.Printf("Stream opening failed specifically due to 'no addresses' for %s, despite earlier check.", targetPeer)
+		}
+		return nil // Indicate failure
+	}
+	// Log success immediately after creation attempt, before handshake
+	log.Printf("Successfully initiated new stream to %s (Stream ID: %s), attempting handshake...", targetPeer, newStream.ID())
+
+	// Perform handshake for the new stream
+	// 1. Write local VPN IP
+	_, err = newStream.Write([]byte(localVPNIP + "\n")) // Use newStream
+	if err != nil {
+		// Log the specific error from Write
+		log.Printf("Handshake Error: Failed writing IP to peer %s (Stream ID: %s): %v", targetPeer, newStream.ID(), err)
+		newStream.Reset() // Close the new stream if handshake fails
+		return nil
+	}
+	// log.Printf("Sent local IP %s to %s (new stream handshake, Stream ID: %s)", localVPNIP, targetPeer, newStream.ID())
+
+	// 2. Read remote peer's VPN IP
+	// Use a timeout for the handshake read
+	handshakeCtx, cancel := context.WithTimeout(ctx, 10*time.Second) // Increased timeout slightly
+	defer cancel()
+	reader := bufio.NewReader(newStream) // Use newStream, buffered reader just for the handshake line
+	var remoteIPStr string
+	readErrCh := make(chan error, 1)
+	go func() {
+		ip, readErr := reader.ReadString('\n') // Capture error within goroutine
+		if readErr != nil {
+			readErrCh <- fmt.Errorf("ReadString failed: %w", readErr) // Wrap error for context
+			return
+		}
+		remoteIPStr = strings.TrimSpace(ip)
+		readErrCh <- nil
+	}()
+
+	select {
+	case err = <-readErrCh:
+		if err != nil {
+			// Log the specific error from ReadString or channel communication
+			log.Printf("Handshake Error: Failed reading IP from peer %s (Stream ID: %s): %v", targetPeer, newStream.ID(), err)
+			newStream.Reset() // Close the new stream
+			return nil
+		}
+		// log.Printf("Received IP %s from %s (new stream handshake, Stream ID: %s)", remoteIPStr, targetPeer, newStream.ID())
+	case <-handshakeCtx.Done():
+		// Log timeout error
+		log.Printf("Handshake Error: Timeout reading IP from peer %s (Stream ID: %s)", targetPeer, newStream.ID())
+		newStream.Reset() // Close the new stream
+		return nil
+	}
+
+	// 3. Update routing table (ensure mapping is correct)
+	routingTableLock.Lock()
+	peerRoutingTable[remoteIPStr] = targetPeer
+	routingTableLock.Unlock()
+	log.Printf("Updated routing table (new stream): %s -> %s", remoteIPStr, targetPeer)
+
+	// Store the newly created and handshaked stream, replacing any existing one.
+	streamLock.Lock()
+	existingStream, exists := peerStreams[targetPeer]
+	if exists {
+		// An existing stream was found. Close it and replace it with the new one.
+		log.Printf("Replacing existing stream (ID: %s) with newly handshaked stream (ID: %s) for peer %s", existingStream.ID(), newStream.ID(), targetPeer)
+		existingStream.Reset() // Close the old stream gracefully
+	}
+	// Store the new stream in the map
+	peerStreams[targetPeer] = newStream
+	streamLock.Unlock()
+	log.Printf("Stored new/updated stream for peer %s (Stream ID: %s)", targetPeer, newStream.ID())
+
+	return newStream // Return the newly handshaked stream
+}
+
+// removeStream closes and removes a stream from the map.
+func removeStream(targetPeer peer.ID) {
+	streamLock.Lock()
+	defer streamLock.Unlock()
+
+	if stream, ok := peerStreams[targetPeer]; ok {
+		log.Printf("Removing and closing stream for peer %s", targetPeer)
+		stream.Reset() // Use Reset for forceful closure
+		delete(peerStreams, targetPeer)
+	}
+}
 
 func main() {
 	// Define command-line flags
 	discoveryTag := flag.String("tag", "p2p-vpn-example", "Unique discovery tag for the VPN service")
 	vpnSubnet := flag.String("subnet", "10.0.8.0/24", "Subnet for the VPN network (e.g., 10.0.8.0/24)")
 	localVPNIPNet := flag.String("ip", "10.0.8.1/24", "Local IP address for this node within the VPN subnet (e.g., 10.0.8.1/24)")
-	exitNodeStr := flag.String("exitnode", "", "Optional Peer ID of the exit node for non-VPN traffic") // Added exit node flag
+	exitNodeStr := flag.String("exitnode", "", "Optional Peer ID of the exit node for non-VPN traffic (used by 'user' role)")
+	flag.StringVar(&nodeRole, "role", roleUser, "Role of this node: 'user' or 'exitnode'") // Added role flag
 
 	flag.Parse() // Parse the flags
+
+	// Validate role
+	if nodeRole != roleUser && nodeRole != roleExitNode {
+		log.Fatalf("Invalid role specified: %s. Must be '%s' or '%s'", nodeRole, roleUser, roleExitNode)
+	}
+	log.Printf("Starting node with role: %s", nodeRole)
 
 	// Extract local IP from CIDR
 	ip, _, err := net.ParseCIDR(*localVPNIPNet)
@@ -129,14 +289,33 @@ func main() {
 	}
 	localVPNIP = ip.String() // Store the local IP
 
-	// Parse Exit Node Peer ID if provided
+	// Parse the VPN Subnet CIDR
+	_, vpnSubnetCIDR, err = net.ParseCIDR(*vpnSubnet)
+	if err != nil {
+		log.Fatalf("Invalid VPN subnet format: %v", err)
+	}
+	log.Printf("Using VPN Subnet: %s", vpnSubnetCIDR.String())
+
+	// Parse Exit Node Peer ID if provided (relevant for 'user' role)
 	if *exitNodeStr != "" {
-		var err error
 		exitNodePeerID, err = peer.Decode(*exitNodeStr)
 		if err != nil {
 			log.Fatalf("Invalid exit node Peer ID: %v", err)
 		}
-		log.Printf("Using exit node: %s", exitNodePeerID.String())
+		log.Printf("Configured exit node: %s", exitNodePeerID.String())
+	} else if nodeRole == roleUser {
+		log.Println("No exit node configured. Only VPN subnet traffic will be routed.")
+	}
+
+	// Add warning for exit node configuration
+	if nodeRole == roleExitNode {
+		log.Println("--- EXIT NODE WARNING ---")
+		log.Println("Ensure OS-level IP forwarding and NAT rules are configured correctly")
+		log.Printf("Example (Linux): sysctl -w net.ipv4.ip_forward=1")
+		log.Printf("Example (Linux): iptables -t nat -A POSTROUTING -s %s -o <wan_interface> -j MASQUERADE", vpnSubnetCIDR.String())
+		log.Println("Example (macOS): sysctl -w net.inet.ip.forwarding=1")
+		log.Println("Example (macOS): Add rule to /etc/pf.conf: nat on <wan_interface> from <tun_interface>:network to any -> (<wan_interface>)")
+		log.Println("-------------------------")
 	}
 
 	tunIface, err := setupTun()
@@ -154,6 +333,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	log.Printf("Node started with ID: %s", node.ID().String())
+	for _, addr := range node.Addrs() {
+		log.Printf("Listening on address: %s/p2p/%s", addr, node.ID().String())
+	}
 
 	notifee := &discoveryNotifee{h: node}
 	// Use flag value for discovery tag
@@ -162,61 +345,124 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// --- Stream Handler ---
+	// (The stream handler logic remains largely the same: it receives packets from a peer
+	// and writes them to the local TUN interface. The OS then routes them.)
 	node.SetStreamHandler("/vpn/1.0.0", func(s network.Stream) {
-		// TODO: Implement a mechanism for peers to announce their VPN IP
-		// when a connection/stream is established. This is needed to populate
-		// the peerRoutingTable.
-		// Example: Read the first message, expect it to be the peer's VPN IP,
-		// then add it to the table.
-		// routingTableLock.Lock()
-		// peerRoutingTable[remotePeerVPNIP] = s.Conn().RemotePeer()
-		// routingTableLock.Unlock()
+		remotePeerID := s.Conn().RemotePeer()
+		log.Printf("New stream connection from %s", remotePeerID)
 
-		go func() {
-			defer s.Close()
+		// Perform handshake: Write local IP, Read remote IP
+		go func(stream network.Stream) { // Pass stream explicitly
+			defer func() {
+				log.Printf("Closing stream handler for %s", remotePeerID)
+				stream.Close() // Ensure stream is closed when handler exits
+				// Remove peer from routing table on disconnect
+				routingTableLock.Lock()
+				var removedIP string
+				for ip, pid := range peerRoutingTable {
+					if pid == remotePeerID {
+						delete(peerRoutingTable, ip)
+						removedIP = ip
+						break
+					}
+				}
+				routingTableLock.Unlock()
+				if removedIP != "" {
+					log.Printf("Removed route for %s (%s) due to stream close", removedIP, remotePeerID)
+				}
+				// Also remove any outgoing stream we might have had for them
+				removeStream(remotePeerID)
+			}()
+
+			// 1. Write local VPN IP to the peer
+			_, err := stream.Write([]byte(localVPNIP + "\n"))
+			if err != nil {
+				log.Printf("Error writing IP to peer %s: %v", remotePeerID, err)
+				stream.Reset() // Reset stream on error
+				return
+			}
+			// log.Printf("Sent local IP %s to %s", localVPNIP, remotePeerID)
+
+			// 2. Read remote peer's VPN IP
+			reader := bufio.NewReader(stream)
+			remoteIPStr, err := reader.ReadString('\n')
+			if err != nil {
+				log.Printf("Error reading IP from peer %s: %v", remotePeerID, err)
+				stream.Reset()
+				return
+			}
+			remoteIPStr = strings.TrimSpace(remoteIPStr)
+			log.Printf("Received IP %s from %s", remoteIPStr, remotePeerID)
+
+			// 3. Update routing table
+			routingTableLock.Lock()
+			peerRoutingTable[remoteIPStr] = remotePeerID
+			routingTableLock.Unlock()
+			log.Printf("Updated routing table: %s -> %s", remoteIPStr, remotePeerID)
+
+			// 4. Now handle packet forwarding from this peer
 			buf := make([]byte, 2000) // MTU size buffer
 			for {
-				n, err := s.Read(buf)
+				n, err := stream.Read(buf) // Use the stream directly now
 				if err != nil {
-					// Log read errors, e.g., stream closed, reset
-					// log.Printf("Error reading from stream peer %s: %v", s.Conn().RemotePeer(), err)
+					// More specific logging for common errors
+					if err == network.ErrReset {
+						log.Printf("Stream reset by peer %s", remotePeerID)
+					} else if err == context.Canceled || err == context.DeadlineExceeded {
+						log.Printf("Stream context error for peer %s: %v", remotePeerID, err)
+					} else {
+						log.Printf("Stream read error from peer %s: %v", remotePeerID, err)
+					}
+					// Error automatically leads to defer cleanup
 					return // Exit goroutine on error
+				}
+
+				if n == 0 { // Should not happen with TCP streams, but check anyway
+					log.Printf("Read 0 bytes from peer %s, continuing", remotePeerID)
+					continue
 				}
 
 				// Basic check: Ensure packet has at least an IPv4 header (20 bytes)
 				if n < 20 {
-					log.Printf("Received runt packet from %s, size %d, discarding", s.Conn().RemotePeer(), n)
+					log.Printf("Received runt packet from %s, size %d, discarding", remotePeerID, n)
 					continue
 				}
 
-				// Optimization: Check destination IP. If it's not localVPNIP,
-				// this node might be acting as a relay. For now, we assume
-				// packets arriving via stream are destined for the local TUN.
-				// More complex routing (peer -> peer via relay) is not handled here.
+				// Log packet reception from peer before writing to TUN
+				destIP := net.IP(buf[16:20]) // Peek at destination IP for logging
+				log.Printf("Read %d bytes from peer %s (Stream ID: %s) for dest %s. Writing to TUN.", n, remotePeerID, stream.ID(), destIP.String())
 
 				// Write packet received from peer to the local TUN interface
-				_, err = tunIface.Write(buf[:n])
-				if err != nil {
-					log.Printf("Error writing to TUN from peer %s: %v", s.Conn().RemotePeer(), err)
-					// Decide if we should continue or return based on the error
+				_, writeErr := tunIface.Write(buf[:n])
+				if writeErr != nil {
+					log.Printf("Error writing %d bytes to TUN from peer %s: %v", n, remotePeerID, writeErr)
+					// Consider if TUN write error should close the stream? For now, continue.
+				} else {
+					// log.Printf("Successfully wrote %d bytes from peer %s to TUN", n, remotePeerID) // Optional success log
 				}
 			}
-		}()
+		}(s) // Pass the stream to the goroutine
 	})
 
+	// --- TUN Reading and Packet Forwarding Goroutine ---
 	go func() {
 		buf := make([]byte, 2000) // MTU size buffer
 		for {
 			n, err := tunIface.Read(buf)
 			if err != nil {
 				log.Println("Error reading TUN:", err)
-				continue // Continue reading after error
+				// Consider if TUN error is fatal; if temporary, continue
+				time.Sleep(100 * time.Millisecond) // Avoid busy-looping on TUN errors
+				continue
 			}
 			if n == 0 {
+				log.Println("Read 0 bytes from TUN, continuing")
 				continue // Skip empty packets
 			}
 
-			packetData := buf[:n]
+			packetData := make([]byte, n) // Create a copy to avoid race conditions if buf is reused quickly
+			copy(packetData, buf[:n])
 
 			// Basic check: Ensure packet has at least an IPv4 header (20 bytes)
 			if n < 20 {
@@ -228,64 +474,87 @@ func main() {
 			// Parse destination IP (IPv4 header: bytes 16-19)
 			destIP := net.IP(packetData[16:20])
 			destIPStr := destIP.String()
+			log.Printf("Read %d bytes from TUN for dest %s", n, destIPStr) // Log packet read from TUN
 
 			// If destination is self, skip forwarding (kernel handles it)
 			if destIPStr == localVPNIP {
-				// log.Printf("Packet destined for local node %s, skipping forwarding", localVPNIP)
+				// log.Printf("Packet dest %s is local VPN IP, skipping forwarding", destIPStr) // Optional log
 				continue
 			}
 
 			var targetPeer peer.ID
 			var found bool
+			var targetType string // For logging
 
-			// 1. Check routing table for specific peer
-			routingTableLock.RLock()
-			targetPeer, found = peerRoutingTable[destIPStr]
-			routingTableLock.RUnlock()
+			// Check if destination is within the VPN subnet
+			isVPNSubnetDest := vpnSubnetCIDR.Contains(destIP)
 
-			if found {
-				// log.Printf("Forwarding packet to specific peer %s for IP %s", targetPeer, destIPStr)
-			} else if exitNodePeerID != "" {
-				// 2. If not found, check if an exit node is configured
-				targetPeer = exitNodePeerID
-				found = true // Mark as found to proceed with forwarding
-				// log.Printf("Forwarding packet for IP %s to exit node %s", destIPStr, targetPeer)
+			if isVPNSubnetDest {
+				// Destination is within our VPN network
+				routingTableLock.RLock()
+				targetPeer, found = peerRoutingTable[destIPStr]
+				routingTableLock.RUnlock()
+				if found {
+					targetType = "VPN Peer"
+					log.Printf("Routing lookup for VPN dest %s: Found peer %s", destIPStr, targetPeer)
+				} else {
+					log.Printf("Routing lookup for VPN dest %s: No route found, dropping packet", destIPStr) // More specific log
+					continue                                                                                 // No route, drop packet
+				}
+			} else {
+				// Destination is outside the VPN network
+				log.Printf("Packet dest %s is outside VPN subnet %s", destIPStr, vpnSubnetCIDR.String())
+				if nodeRole == roleUser {
+					if exitNodePeerID != "" {
+						// User node forwards non-VPN traffic to the exit node
+						targetPeer = exitNodePeerID
+						found = true
+						targetType = "Exit Node"
+						log.Printf("Routing non-VPN packet for %s to %s (%s)", destIPStr, targetPeer, targetType)
+					} else {
+						// User node, but no exit node configured
+						log.Printf("Non-VPN destination %s and no exit node configured, dropping packet", destIPStr)
+						continue // No exit node, drop packet
+					}
+				} else if nodeRole == roleExitNode {
+					// Exit node: Let the OS handle routing it out the physical interface.
+					log.Printf("Exit node letting OS handle non-VPN packet for %s", destIPStr)
+					found = false // Prevent forwarding within this loop
+					continue      // Let OS handle it
+				}
 			}
 
-			// 3. Forward if a target (specific peer or exit node) was found
+			// Forward if a target (specific peer or exit node) was found
 			if found {
 				if targetPeer == node.ID() { // Avoid sending to self
+					log.Printf("Target peer %s is self, skipping forwarding for %s", targetPeer, destIPStr)
 					continue
 				}
-				stream, err := node.NewStream(context.Background(), targetPeer, "/vpn/1.0.0")
-				if err != nil {
-					log.Printf("Failed to open stream to target peer %s for IP %s: %v", targetPeer, destIPStr, err)
-					continue // Try next packet
+
+				// Get or create a persistent stream
+				// Use a background context, maybe add timeout later if needed
+				log.Printf("Attempting to get/create stream for target %s (%s) for packet to %s", targetPeer, targetType, destIPStr)
+				stream := getOrCreateStream(context.Background(), node, targetPeer)
+				if stream == nil {
+					// Log remains the same, but the error from getOrCreateStream should be more specific now
+					log.Printf("Failed to get/create stream for target %s (%s), dropping packet for %s", targetPeer, targetType, destIPStr)
+					continue // Cannot establish stream, drop packet
 				}
 
+				// Write the actual packet data to the persistent stream
+				log.Printf("Forwarding %d bytes for %s to %s (%s) via stream %s", len(packetData), destIPStr, targetPeer, targetType, stream.ID())
 				_, err = stream.Write(packetData)
 				if err != nil {
-					log.Printf("Error writing packet to peer %s for IP %s: %v", targetPeer, destIPStr, err)
-					stream.Reset()
+					log.Printf("Error writing %d bytes to stream for peer %s (%s) for IP %s: %v. Closing stream.", len(packetData), targetPeer, targetType, destIPStr, err)
+					// Assume stream is dead, remove it. getOrCreateStream will make a new one next time.
+					removeStream(targetPeer)
+					// Don't continue to next packet immediately, let the loop run again
 				} else {
-					stream.CloseWrite() // Gracefully close write side
+					// log.Printf("Successfully forwarded %d bytes for %s to peer %s (%s)", len(packetData), destIPStr, targetPeer, targetType) // Optional success log
+					// Do NOT close the stream here. Keep it open for reuse.
 				}
-				// stream.Close() // Close might be too soon, CloseWrite is better
-			} else {
-				// 4. Destination unknown and no exit node
-				log.Printf("No route for destination IP %s, dropping packet", destIPStr)
 			}
-
-			// --- End Packet Forwarding Logic ---
-
-			// Remove the old broadcast logic:
-			/*
-				for _, p := range node.Peerstore().Peers() {
-					if p == node.ID() {
-						continue
-					}
-					// ... old stream opening and writing ...
-			*/
+			// else: Packet was dropped or handled by OS (exit node local traffic)
 		}
 	}()
 
@@ -293,6 +562,30 @@ func main() {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
 	<-c
-	fmt.Println("Shutting down...")
-	node.Close()
+	fmt.Println("\nShutting down...")
+
+	// Close TUN interface (best effort)
+	if tunIface != nil {
+		log.Println("Closing TUN interface...")
+		tunIface.Close()
+	}
+
+	// Close all active peer streams
+	log.Println("Closing peer streams...")
+	streamLock.Lock()
+	for pid, stream := range peerStreams {
+		log.Printf("Closing stream to %s", pid)
+		stream.Reset() // Force close
+	}
+	peerStreams = make(map[peer.ID]network.Stream) // Clear the map
+	streamLock.Unlock()
+
+	// Close the libp2p node
+	log.Println("Closing libp2p node...")
+	if err := node.Close(); err != nil {
+		log.Printf("Error closing libp2p node: %v", err)
+	}
+
+	log.Println("Shutdown complete.")
+	// TODO: Remove routes/IP config from TUN? (Might require elevated privileges and OS-specific commands)
 }
