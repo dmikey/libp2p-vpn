@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"strconv" // Added for parsing user input
 	"strings"
 	"sync"
 	"syscall"
@@ -34,12 +35,31 @@ func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	// Log regardless of whether it's the exit node or not
 	log.Printf("mDNS Found peer: %s with %d addresses", pi.ID.String(), len(pi.Addrs))
 
-	// Check if the found peer is the configured exit node
-	isExitNode := exitNodePeerID != "" && pi.ID == exitNodePeerID
-	if isExitNode {
+	// Check if this node is a user node and interactive selection is needed
+	isUserRole := nodeRole == roleUser
+	needsInteractiveSelection := isUserRole && exitNodePeerID == "" && !exitNodePreconfigured // Check if exit node was preconfigured
+
+	if needsInteractiveSelection {
+		// Add to list for potential selection later
+		discoveredPeersLock.Lock()
+		if _, exists := discoveredPeers[pi.ID]; !exists {
+			log.Printf("Adding potential exit node %s to selection list", pi.ID.String())
+			discoveredPeers[pi.ID] = pi
+		}
+		discoveredPeersLock.Unlock()
+		// Do not attempt connection here, wait for user selection
+		return
+	}
+
+	// --- Existing Logic for Pre-configured Exit Node or Non-User Roles ---
+
+	// Check if the found peer is the *pre-configured* exit node
+	isConfiguredExitNode := exitNodePreconfigured && pi.ID == exitNodePeerID
+	if isConfiguredExitNode {
 		log.Printf(">>> Discovered configured Exit Node: %s", pi.ID.String())
 	}
 
+	// Connect logic (only if not interactive selection OR if it's the pre-configured exit node)
 	// Check if we already have addresses for this peer in the peerstore
 	// Also check if we are already connected
 	if len(n.h.Peerstore().Addrs(pi.ID)) == 0 || n.h.Network().Connectedness(pi.ID) != network.Connected {
@@ -50,44 +70,38 @@ func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 			log.Printf("Failed to connect to newly found peer %s: %v", pi.ID.String(), err)
 		} else {
 			log.Printf("Successfully connected to %s (addresses should now be in peerstore)", pi.ID.String())
-			if isExitNode {
-				log.Printf(">>> Successfully connected to Exit Node: %s", pi.ID.String())
+			// If it's the pre-configured exit node, try to establish stream proactively
+			if isConfiguredExitNode {
+				log.Printf(">>> Successfully connected to Configured Exit Node: %s", pi.ID.String())
 				// --- Proactively establish VPN stream after successful connection ---
-				log.Printf("Attempting to proactively establish VPN stream with %s", pi.ID.String())
-				// Use a short timeout context for this attempt
-				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // Increased timeout slightly
-				defer cancel()
+				log.Printf("Attempting to proactively establish VPN stream with configured exit node %s", pi.ID.String())
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				stream := getOrCreateStream(ctx, n.h, pi.ID)
 				if stream != nil {
-					log.Printf("Successfully established proactive VPN stream with %s (Stream ID: %s)", pi.ID.String(), stream.ID())
-					// Note: getOrCreateStream handles adding to peerStreams map
+					log.Printf("Successfully established proactive VPN stream with configured exit node %s (Stream ID: %s)", pi.ID.String(), stream.ID())
 				} else {
-					log.Printf("Failed to establish proactive VPN stream with %s (will retry on demand)", pi.ID.String())
-					// No need to remove stream here, getOrCreateStream handles cleanup on failure
+					log.Printf("Failed to establish proactive VPN stream with configured exit node %s (will retry on demand)", pi.ID.String())
 				}
+				cancel() // Cancel context after use
 				// --- End proactive stream establishment ---
 			}
 		}
-	} else {
-		// Optional: Log if the peer was found again but we were already connected
-		// log.Printf("Peer %s found by mDNS, already connected.", pi.ID.String())
-
-		// --- Check if VPN stream exists, if not, try to establish it ---
-		// This handles cases where the initial connection might exist, but the VPN stream dropped or wasn't established.
+	} else if isConfiguredExitNode { // Only check stream if it's the configured exit node and already connected
+		// --- Check if VPN stream exists for the configured exit node, if not, try to establish it ---
 		streamLock.Lock()
 		_, streamExists := peerStreams[pi.ID]
 		streamLock.Unlock()
 
 		if !streamExists {
-			log.Printf("Peer %s connected, but no active VPN stream found. Attempting proactive stream establishment.", pi.ID.String())
+			log.Printf("Configured Exit Node %s connected, but no active VPN stream found. Attempting proactive stream establishment.", pi.ID.String())
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
 			stream := getOrCreateStream(ctx, n.h, pi.ID)
 			if stream != nil {
-				log.Printf("Successfully established proactive VPN stream with %s (Stream ID: %s) on re-discovery.", pi.ID.String(), stream.ID())
+				log.Printf("Successfully established proactive VPN stream with configured exit node %s (Stream ID: %s) on re-discovery.", pi.ID.String(), stream.ID())
 			} else {
-				log.Printf("Failed to establish proactive VPN stream with %s on re-discovery (will retry on demand).", pi.ID.String())
+				log.Printf("Failed to establish proactive VPN stream with configured exit node %s on re-discovery (will retry on demand).", pi.ID.String())
 			}
+			cancel() // Cancel context after use
 		}
 		// --- End stream check ---
 	}
@@ -237,6 +251,13 @@ var (
 	// Map to store active outgoing streams to peers
 	peerStreams = make(map[peer.ID]network.Stream)
 	streamLock  sync.Mutex
+
+	// For interactive exit node selection
+	discoveredPeers        = make(map[peer.ID]peer.AddrInfo)
+	discoveredPeersLock    sync.RWMutex
+	exitNodeSelectedChan   = make(chan struct{}) // Closed when selection is done
+	exitNodePreconfigured  = false               // Flag to track if -exitnode was used
+	interactiveSelectionWG sync.WaitGroup        // To wait for selection goroutine
 )
 
 const (
@@ -396,6 +417,80 @@ func removeStream(targetPeer peer.ID) {
 	}
 }
 
+// promptUserForExitNode displays discovered peers and prompts the user to select one.
+func promptUserForExitNode(node host.Host) {
+	defer interactiveSelectionWG.Done() // Signal that this goroutine has finished
+
+	log.Println("Waiting for 10 seconds to discover potential exit nodes...")
+	time.Sleep(10 * time.Second)
+
+	discoveredPeersLock.RLock()
+	if len(discoveredPeers) == 0 {
+		log.Println("No potential exit nodes discovered after 10 seconds.")
+		discoveredPeersLock.RUnlock()
+		close(exitNodeSelectedChan) // Signal that selection process is over (even if none selected)
+		return
+	}
+
+	fmt.Println("\n--- Potential Exit Nodes ---")
+	peerList := make([]peer.AddrInfo, 0, len(discoveredPeers))
+	i := 0
+	for _, pi := range discoveredPeers {
+		// Filter out self
+		if pi.ID == node.ID() {
+			continue
+		}
+		fmt.Printf("[%d] %s\n", i, pi.ID.String())
+		peerList = append(peerList, pi)
+		i++
+	}
+	discoveredPeersLock.RUnlock() // Unlock before blocking on input
+
+	if len(peerList) == 0 {
+		log.Println("No other peers discovered to select as exit node.")
+		close(exitNodeSelectedChan)
+		return
+	}
+
+	fmt.Print("Select exit node by number (or press Enter to skip): ")
+	reader := bufio.NewReader(os.Stdin)
+	input, _ := reader.ReadString('\n')
+	input = strings.TrimSpace(input)
+
+	if input == "" {
+		log.Println("Skipping exit node selection.")
+		close(exitNodeSelectedChan)
+		return
+	}
+
+	choice, err := strconv.Atoi(input)
+	if err != nil || choice < 0 || choice >= len(peerList) {
+		log.Printf("Invalid selection: %s. No exit node selected.", input)
+		close(exitNodeSelectedChan)
+		return
+	}
+
+	selectedPeerInfo := peerList[choice]
+	exitNodePeerID = selectedPeerInfo.ID // Set the global variable
+	log.Printf(">>> User selected %s as the exit node.", exitNodePeerID.String())
+
+	// Signal that selection is complete *before* attempting connection
+	close(exitNodeSelectedChan)
+
+	// Attempt to connect and establish stream proactively
+	log.Printf("Attempting to connect and establish stream with selected exit node %s...", exitNodePeerID)
+	// Add addresses to peerstore if not already there (discovery might not have connected yet)
+	node.Peerstore().AddAddrs(selectedPeerInfo.ID, selectedPeerInfo.Addrs, time.Hour)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second) // Longer timeout for initial connection + stream
+	defer cancel()
+	stream := getOrCreateStream(ctx, node, exitNodePeerID)
+	if stream != nil {
+		log.Printf("Successfully established proactive VPN stream with selected exit node %s (Stream ID: %s)", exitNodePeerID, stream.ID())
+	} else {
+		log.Printf("Failed to establish proactive VPN stream with selected exit node %s (will retry on demand)", exitNodePeerID)
+	}
+}
+
 func main() {
 	// Define command-line flags
 	discoveryTag := flag.String("tag", "p2p-vpn-example", "Unique discovery tag for the VPN service")
@@ -426,15 +521,21 @@ func main() {
 	}
 	log.Printf("Using VPN Subnet: %s", vpnSubnetCIDR.String())
 
-	// Parse Exit Node Peer ID if provided (relevant for 'user' role)
+	// Parse Exit Node Peer ID if provided
 	if *exitNodeStr != "" {
+		var err error
 		exitNodePeerID, err = peer.Decode(*exitNodeStr)
 		if err != nil {
 			log.Fatalf("Invalid exit node Peer ID: %v", err)
 		}
-		log.Printf("Configured exit node: %s", exitNodePeerID.String())
+		log.Printf("Using pre-configured exit node: %s", exitNodePeerID.String())
+		exitNodePreconfigured = true // Mark that it was set via flag
 	} else if nodeRole == roleUser {
-		log.Println("No exit node configured. Only VPN subnet traffic will be routed.")
+		log.Println("No exit node pre-configured. Will prompt for selection after discovery.")
+		// Don't close exitNodeSelectedChan here, wait for prompt function
+	} else {
+		// Exit node role or user role with no exit node needed/wanted
+		close(exitNodeSelectedChan) // Signal immediately if no selection is needed
 	}
 
 	// Add warning for exit node configuration
@@ -473,6 +574,21 @@ func main() {
 	srv := mdns.NewMdnsService(node, *discoveryTag, notifee)
 	if err := srv.Start(); err != nil {
 		log.Fatal(err)
+	}
+
+	// --- Interactive Exit Node Selection (if applicable) ---
+	if nodeRole == roleUser && !exitNodePreconfigured {
+		interactiveSelectionWG.Add(1)
+		go promptUserForExitNode(node) // Start selection in background
+		// We don't necessarily need to wait here using interactiveSelectionWG.Wait()
+		// The TUN reader loop will function correctly even before selection.
+		// However, waiting ensures the prompt appears before potential traffic flow logs.
+		// Let's wait for the selection process *goroutine* to finish,
+		// but the actual selection might be skipped by the user.
+		// The exitNodeSelectedChan is used later if we need to ensure selection happened.
+		log.Println("User node started, waiting for exit node selection prompt...")
+	} else {
+		log.Println("Proceeding without interactive exit node selection.")
 	}
 
 	// --- Stream Handler ---
@@ -687,16 +803,21 @@ func main() {
 				// Destination is outside the VPN network
 				// log.Printf("Packet dest %s (from %s) is outside VPN subnet %s", destIPStr, sourceIPStr, vpnSubnetCIDR.String()) // Optional log
 				if nodeRole == roleUser {
-					if exitNodePeerID != "" {
-						// User node forwards non-VPN traffic to the exit node
-						targetPeer = exitNodePeerID
+					// --- Check if exit node has been selected ---
+					// We read the global exitNodePeerID here. If it's empty,
+					// non-VPN packets will be dropped. If it's set (either
+					// pre-configured or selected by user), we use it.
+					currentExitNodeID := exitNodePeerID // Read volatile variable once per packet check
+					if currentExitNodeID != "" {
+						targetPeer = currentExitNodeID
 						found = true
 						targetType = "Exit Node"
-						log.Printf("Routing non-VPN packet (from %s) for %s to %s (%s)", sourceIPStr, destIPStr, targetPeer, targetType) // Enhanced log
+						// log.Printf("Routing non-VPN packet (from %s) for %s to %s (%s)", sourceIPStr, destIPStr, targetPeer, targetType) // Reduced verbosity
 					} else {
-						// User node, but no exit node configured
-						log.Printf("Non-VPN destination %s (from %s) and no exit node configured, dropping packet", destIPStr, sourceIPStr) // Enhanced log
-						continue                                                                                                            // No exit node, drop packet
+						// User node, but no exit node configured OR selection not yet made/skipped
+						// log.Printf("Non-VPN destination %s (from %s) and no exit node available, dropping packet", destIPStr, sourceIPStr) // Reduced verbosity
+						found = false // Ensure packet is dropped
+						continue
 					}
 				} else if nodeRole == roleExitNode {
 					// Exit node: Let the OS handle routing it out the physical interface.
@@ -744,6 +865,12 @@ func main() {
 	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
 	<-c
 	fmt.Println("\nShutting down...")
+
+	// Wait for the selection goroutine to finish if it was started
+	if nodeRole == roleUser && !exitNodePreconfigured {
+		log.Println("Waiting for selection goroutine to complete...")
+		interactiveSelectionWG.Wait()
+	}
 
 	// Close all active peer streams first to stop traffic
 	log.Println("Closing peer streams...")
