@@ -163,6 +163,68 @@ func configureTunDevice(ifaceName, ipNet, subnet string) error { // Added subnet
 	return nil
 }
 
+// cleanupTunDevice removes the IP address and routes for the TUN device.
+func cleanupTunDevice(ifaceName, ipNet, subnet string) { // Added subnet parameter
+	ipAddr := strings.Split(ipNet, "/")[0]
+	// subnet := ipNet // e.g., 10.0.8.0/24 // Removed this line, use parameter instead
+
+	log.Printf("Cleaning up TUN device %s (IP: %s, Subnet: %s)", ifaceName, ipNet, subnet)
+
+	var routeCmd *exec.Cmd
+	var ipCmd *exec.Cmd
+	var downCmd *exec.Cmd
+
+	switch runtime.GOOS {
+	case "darwin":
+		// Delete route first
+		routeCmd = exec.Command("route", "delete", "-net", subnet, ipAddr) // Use subnet parameter
+		log.Printf("Running command: %s", routeCmd.String())
+		if err := routeCmd.Run(); err != nil {
+			// Log error but continue cleanup
+			log.Printf("Warning: failed to delete route on macOS: %v", err)
+		}
+		// Bring interface down (might implicitly remove IP or make it easier)
+		downCmd = exec.Command("ifconfig", ifaceName, "down")
+		log.Printf("Running command: %s", downCmd.String())
+		if err := downCmd.Run(); err != nil {
+			log.Printf("Warning: failed to bring down interface %s on macOS: %v", ifaceName, err)
+		}
+		// Attempt to delete IP (might fail if 'down' removed it, which is fine)
+		// Note: 'ifconfig delete' might not be standard. Bringing down is usually sufficient.
+		// We'll skip explicit IP deletion on macOS for now as 'down' often handles it.
+		// ipCmd = exec.Command("ifconfig", ifaceName, "inet", ipAddr, "-alias") // Alternative?
+		// log.Printf("Running command: %s", ipCmd.String())
+		// if err := ipCmd.Run(); err != nil {
+		// 	log.Printf("Warning: failed to remove IP address on macOS: %v", err)
+		// }
+
+	case "linux":
+		// Delete route
+		routeCmd = exec.Command("ip", "route", "del", subnet, "dev", ifaceName) // Use subnet parameter
+		log.Printf("Running command: %s", routeCmd.String())
+		if err := routeCmd.Run(); err != nil {
+			// Log error but continue cleanup
+			log.Printf("Warning: failed to delete route on Linux: %v", err)
+		}
+		// Remove IP address
+		ipCmd = exec.Command("ip", "addr", "del", ipNet, "dev", ifaceName)
+		log.Printf("Running command: %s", ipCmd.String())
+		if err := ipCmd.Run(); err != nil {
+			log.Printf("Warning: failed to remove IP address on Linux: %v", err)
+		}
+		// Bring interface down
+		downCmd = exec.Command("ip", "link", "set", "dev", ifaceName, "down")
+		log.Printf("Running command: %s", downCmd.String())
+		if err := downCmd.Run(); err != nil {
+			log.Printf("Warning: failed to bring down interface %s on Linux: %v", ifaceName, err)
+		}
+	default:
+		log.Printf("Cleanup not implemented for OS: %s", runtime.GOOS)
+	}
+
+	log.Printf("Finished cleanup attempt for TUN device %s", ifaceName)
+}
+
 // Global routing table, exit node info, role, subnet info, and stream management
 var (
 	peerRoutingTable = make(map[string]peer.ID)
@@ -709,13 +771,7 @@ func main() {
 	<-c
 	fmt.Println("\nShutting down...")
 
-	// Close TUN interface (best effort)
-	if tunIface != nil {
-		log.Println("Closing TUN interface...")
-		tunIface.Close()
-	}
-
-	// Close all active peer streams
+	// Close all active peer streams first to stop traffic
 	log.Println("Closing peer streams...")
 	streamLock.Lock()
 	for pid, stream := range peerStreams {
@@ -724,6 +780,18 @@ func main() {
 	}
 	peerStreams = make(map[peer.ID]network.Stream) // Clear the map
 	streamLock.Unlock()
+
+	// Cleanup TUN device configuration (IP, routes) before closing the interface
+	if tunIface != nil {
+		log.Println("Cleaning up TUN device configuration...")
+		cleanupTunDevice(tunIface.Name(), *localVPNIPNet, *vpnSubnet) // Call cleanup function
+	}
+
+	// Close TUN interface (best effort)
+	if tunIface != nil {
+		log.Println("Closing TUN interface...")
+		tunIface.Close()
+	}
 
 	// Close the libp2p node
 	log.Println("Closing libp2p node...")
