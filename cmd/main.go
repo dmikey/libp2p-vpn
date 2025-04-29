@@ -41,9 +41,10 @@ func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	}
 
 	// Check if we already have addresses for this peer in the peerstore
-	if len(n.h.Peerstore().Addrs(pi.ID)) == 0 {
-		log.Printf("Peerstore has no addresses for %s, attempting connection to populate.", pi.ID.String())
-		// Attempt to connect to the newly found peer to populate addresses
+	// Also check if we are already connected
+	if len(n.h.Peerstore().Addrs(pi.ID)) == 0 || n.h.Network().Connectedness(pi.ID) != network.Connected {
+		log.Printf("Peer %s not connected or no addresses known, attempting connection...", pi.ID.String())
+		// Attempt to connect to the newly found peer to populate addresses and establish connection
 		err := n.h.Connect(context.Background(), pi)
 		if err != nil {
 			log.Printf("Failed to connect to newly found peer %s: %v", pi.ID.String(), err)
@@ -51,11 +52,44 @@ func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 			log.Printf("Successfully connected to %s (addresses should now be in peerstore)", pi.ID.String())
 			if isExitNode {
 				log.Printf(">>> Successfully connected to Exit Node: %s", pi.ID.String())
+				// --- Proactively establish VPN stream after successful connection ---
+				log.Printf("Attempting to proactively establish VPN stream with %s", pi.ID.String())
+				// Use a short timeout context for this attempt
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // Increased timeout slightly
+				defer cancel()
+				stream := getOrCreateStream(ctx, n.h, pi.ID)
+				if stream != nil {
+					log.Printf("Successfully established proactive VPN stream with %s (Stream ID: %s)", pi.ID.String(), stream.ID())
+					// Note: getOrCreateStream handles adding to peerStreams map
+				} else {
+					log.Printf("Failed to establish proactive VPN stream with %s (will retry on demand)", pi.ID.String())
+					// No need to remove stream here, getOrCreateStream handles cleanup on failure
+				}
+				// --- End proactive stream establishment ---
 			}
 		}
 	} else {
-		// Optional: Log if the peer was found again but we already knew its addresses
-		// log.Printf("Peer %s found by mDNS, but addresses already known in peerstore.", pi.ID.String())
+		// Optional: Log if the peer was found again but we were already connected
+		// log.Printf("Peer %s found by mDNS, already connected.", pi.ID.String())
+
+		// --- Check if VPN stream exists, if not, try to establish it ---
+		// This handles cases where the initial connection might exist, but the VPN stream dropped or wasn't established.
+		streamLock.Lock()
+		_, streamExists := peerStreams[pi.ID]
+		streamLock.Unlock()
+
+		if !streamExists {
+			log.Printf("Peer %s connected, but no active VPN stream found. Attempting proactive stream establishment.", pi.ID.String())
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			stream := getOrCreateStream(ctx, n.h, pi.ID)
+			if stream != nil {
+				log.Printf("Successfully established proactive VPN stream with %s (Stream ID: %s) on re-discovery.", pi.ID.String(), stream.ID())
+			} else {
+				log.Printf("Failed to establish proactive VPN stream with %s on re-discovery (will retry on demand).", pi.ID.String())
+			}
+		}
+		// --- End stream check ---
 	}
 }
 
@@ -151,6 +185,12 @@ const (
 // getOrCreateStream finds an existing stream to the target peer or creates a new one.
 // Performs handshake for new streams. Returns nil if a stream cannot be established.
 func getOrCreateStream(ctx context.Context, node host.Host, targetPeer peer.ID) network.Stream {
+	// Add a check to prevent dialing self
+	if targetPeer == node.ID() {
+		log.Printf("Attempted to get/create stream to self (%s), skipping.", targetPeer)
+		return nil
+	}
+
 	streamLock.Lock()
 	stream, ok := peerStreams[targetPeer]
 	streamLock.Unlock()
@@ -172,16 +212,43 @@ func getOrCreateStream(ctx context.Context, node host.Host, targetPeer peer.ID) 
 	}
 	// --- End address check ---
 
+	// --- Check connectedness before creating stream ---
+	if node.Network().Connectedness(targetPeer) != network.Connected {
+		log.Printf("Cannot open stream: Peer %s is not connected. Waiting for connection.", targetPeer)
+		// Attempting a connect here might be redundant if discovery is running,
+		// but could help if discovery missed it or the connection dropped.
+		// Let's try connecting explicitly if not connected.
+		connectCtx, cancel := context.WithTimeout(ctx, 10*time.Second) // Use parent ctx for timeout
+		defer cancel()
+		log.Printf("Attempting explicit connect to %s before creating stream...", targetPeer)
+		err := node.Connect(connectCtx, peer.AddrInfo{ID: targetPeer, Addrs: peerAddrs})
+		if err != nil {
+			log.Printf("Explicit connect to %s failed: %v. Cannot create stream.", targetPeer, err)
+			return nil
+		}
+		log.Printf("Explicit connect to %s successful.", targetPeer)
+		// Re-check connectedness just in case
+		if node.Network().Connectedness(targetPeer) != network.Connected {
+			log.Printf("Peer %s still not connected after explicit attempt. Cannot create stream.", targetPeer)
+			return nil
+		}
+	}
+	// --- End connectedness check ---
+
 	// No existing stream, create a new one
 	// Log the addresses we know for debugging
-	log.Printf("Attempting to open NEW stream to %s (addresses known)", targetPeer) // Modified log
-	newStream, err := node.NewStream(ctx, targetPeer, "/vpn/1.0.0")                 // Use new variable name
+	log.Printf("Attempting to open NEW stream to %s (addresses known, peer connected)", targetPeer) // Modified log
+	newStream, err := node.NewStream(ctx, targetPeer, "/vpn/1.0.0")                                 // Use new variable name
 	if err != nil {
 		// Log the specific error from NewStream
 		log.Printf("Failed to open new stream to target %s: %v", targetPeer, err)
 		// Check if the error is due to lack of addresses again, although the check above should prevent this.
 		if strings.Contains(err.Error(), "no addresses") {
 			log.Printf("Stream opening failed specifically due to 'no addresses' for %s, despite earlier check.", targetPeer)
+		} else if strings.Contains(err.Error(), "context deadline exceeded") {
+			log.Printf("Stream opening to %s failed due to context deadline exceeded.", targetPeer)
+		} else if strings.Contains(err.Error(), "dial backoff") {
+			log.Printf("Stream opening to %s failed due to dial backoff.", targetPeer)
 		}
 		return nil // Indicate failure
 	}
@@ -190,6 +257,13 @@ func getOrCreateStream(ctx context.Context, node host.Host, targetPeer peer.ID) 
 
 	// Perform handshake for the new stream
 	// 1. Write local VPN IP
+	// Set deadline for write
+	writeDeadline := time.Now().Add(10 * time.Second)
+	if err := newStream.SetWriteDeadline(writeDeadline); err != nil {
+		log.Printf("Handshake Error: Failed setting write deadline for peer %s (Stream ID: %s): %v", targetPeer, newStream.ID(), err)
+		newStream.Reset()
+		return nil
+	}
 	_, err = newStream.Write([]byte(localVPNIP + "\n")) // Use newStream
 	if err != nil {
 		// Log the specific error from Write
@@ -197,40 +271,35 @@ func getOrCreateStream(ctx context.Context, node host.Host, targetPeer peer.ID) 
 		newStream.Reset() // Close the new stream if handshake fails
 		return nil
 	}
+	// Reset deadline after successful write
+	if err := newStream.SetWriteDeadline(time.Time{}); err != nil { // Zero time removes deadline
+		log.Printf("Handshake Warning: Failed resetting write deadline for peer %s (Stream ID: %s): %v", targetPeer, newStream.ID(), err)
+		// Continue anyway, but log the warning
+	}
 	// log.Printf("Sent local IP %s to %s (new stream handshake, Stream ID: %s)", localVPNIP, targetPeer, newStream.ID())
 
 	// 2. Read remote peer's VPN IP
-	// Use a timeout for the handshake read
-	handshakeCtx, cancel := context.WithTimeout(ctx, 10*time.Second) // Increased timeout slightly
-	defer cancel()
+	// Use a timeout for the handshake read - context passed in should handle this, but SetReadDeadline is more direct for the I/O op
+	readDeadline := time.Now().Add(10 * time.Second)
+	if err := newStream.SetReadDeadline(readDeadline); err != nil {
+		log.Printf("Handshake Error: Failed setting read deadline for peer %s (Stream ID: %s): %v", targetPeer, newStream.ID(), err)
+		newStream.Reset()
+		return nil
+	}
 	reader := bufio.NewReader(newStream) // Use newStream, buffered reader just for the handshake line
-	var remoteIPStr string
-	readErrCh := make(chan error, 1)
-	go func() {
-		ip, readErr := reader.ReadString('\n') // Capture error within goroutine
-		if readErr != nil {
-			readErrCh <- fmt.Errorf("ReadString failed: %w", readErr) // Wrap error for context
-			return
-		}
-		remoteIPStr = strings.TrimSpace(ip)
-		readErrCh <- nil
-	}()
-
-	select {
-	case err = <-readErrCh:
-		if err != nil {
-			// Log the specific error from ReadString or channel communication
-			log.Printf("Handshake Error: Failed reading IP from peer %s (Stream ID: %s): %v", targetPeer, newStream.ID(), err)
-			newStream.Reset() // Close the new stream
-			return nil
-		}
-		// log.Printf("Received IP %s from %s (new stream handshake, Stream ID: %s)", remoteIPStr, targetPeer, newStream.ID())
-	case <-handshakeCtx.Done():
-		// Log timeout error
-		log.Printf("Handshake Error: Timeout reading IP from peer %s (Stream ID: %s)", targetPeer, newStream.ID())
+	remoteIPStr, err := reader.ReadString('\n')
+	// Reset deadline immediately after read attempt, regardless of success/failure
+	if errReset := newStream.SetReadDeadline(time.Time{}); errReset != nil {
+		log.Printf("Handshake Warning: Failed resetting read deadline for peer %s (Stream ID: %s): %v", targetPeer, newStream.ID(), errReset)
+	}
+	// Now check the error from ReadString
+	if err != nil {
+		log.Printf("Handshake Error: Failed reading IP from peer %s (Stream ID: %s): %v", targetPeer, newStream.ID(), err)
 		newStream.Reset() // Close the new stream
 		return nil
 	}
+	remoteIPStr = strings.TrimSpace(remoteIPStr)
+	// log.Printf("Received IP %s from %s (new stream handshake, Stream ID: %s)", remoteIPStr, targetPeer, newStream.ID())
 
 	// 3. Update routing table (ensure mapping is correct)
 	routingTableLock.Lock()
@@ -254,7 +323,6 @@ func getOrCreateStream(ctx context.Context, node host.Host, targetPeer peer.ID) 
 	return newStream // Return the newly handshaked stream
 }
 
-// removeStream closes and removes a stream from the map.
 func removeStream(targetPeer peer.ID) {
 	streamLock.Lock()
 	defer streamLock.Unlock()
@@ -350,12 +418,14 @@ func main() {
 	// and writes them to the local TUN interface. The OS then routes them.)
 	node.SetStreamHandler("/vpn/1.0.0", func(s network.Stream) {
 		remotePeerID := s.Conn().RemotePeer()
-		log.Printf("New stream connection from %s", remotePeerID)
+		// Use a unique identifier for this handler instance for easier log tracking
+		handlerID := fmt.Sprintf("%s->%s", remotePeerID.ShortString(), node.ID().ShortString())
+		log.Printf("[%s] New INCOMING stream connection from %s (Stream ID: %s)", handlerID, remotePeerID, s.ID())
 
 		// Perform handshake: Write local IP, Read remote IP
 		go func(stream network.Stream) { // Pass stream explicitly
 			defer func() {
-				log.Printf("Closing stream handler for %s", remotePeerID)
+				log.Printf("[%s] Closing stream handler for %s (Stream ID: %s)", handlerID, remotePeerID, stream.ID())
 				stream.Close() // Ensure stream is closed when handler exits
 				// Remove peer from routing table on disconnect
 				routingTableLock.Lock()
@@ -369,77 +439,152 @@ func main() {
 				}
 				routingTableLock.Unlock()
 				if removedIP != "" {
-					log.Printf("Removed route for %s (%s) due to stream close", removedIP, remotePeerID)
+					log.Printf("[%s] Removed route for %s (%s) due to stream close", handlerID, removedIP, remotePeerID)
 				}
 				// Also remove any outgoing stream we might have had for them
-				removeStream(remotePeerID)
+				removeStream(remotePeerID) // removeStream already logs
 			}()
 
+			// --- Handshake Timeout Context ---
+			// Use a context for the overall handshake process within the handler
+			handlerHandshakeCtx, handlerCancel := context.WithTimeout(context.Background(), 20*time.Second) // Slightly longer timeout for handler side
+			defer handlerCancel()
+
 			// 1. Write local VPN IP to the peer
+			log.Printf("[%s] Handshake Step 1: Writing local IP %s to %s", handlerID, localVPNIP, remotePeerID)
+			// Set deadline for write
+			writeDeadline := time.Now().Add(10 * time.Second)
+			if err := stream.SetWriteDeadline(writeDeadline); err != nil {
+				log.Printf("[%s] Handshake Step 1 FAILED: Error setting write deadline for peer %s: %v", handlerID, remotePeerID, err)
+				stream.Reset()
+				return
+			}
 			_, err := stream.Write([]byte(localVPNIP + "\n"))
+			// Reset deadline immediately
+			if errReset := stream.SetWriteDeadline(time.Time{}); errReset != nil {
+				log.Printf("[%s] Handshake Warning: Failed resetting write deadline for peer %s: %v", handlerID, remotePeerID, errReset)
+			}
+			// Check write error
 			if err != nil {
-				log.Printf("Error writing IP to peer %s: %v", remotePeerID, err)
+				log.Printf("[%s] Handshake Step 1 FAILED: Error writing IP to peer %s: %v", handlerID, remotePeerID, err)
 				stream.Reset() // Reset stream on error
 				return
 			}
-			// log.Printf("Sent local IP %s to %s", localVPNIP, remotePeerID)
+			log.Printf("[%s] Handshake Step 1 SUCCESS: Sent local IP %s to %s", handlerID, localVPNIP, remotePeerID)
 
 			// 2. Read remote peer's VPN IP
-			reader := bufio.NewReader(stream)
+			log.Printf("[%s] Handshake Step 2: Reading remote IP from %s", handlerID, remotePeerID)
+			// Set read deadline
+			readDeadline := time.Now().Add(10 * time.Second)
+			if err := stream.SetReadDeadline(readDeadline); err != nil {
+				log.Printf("[%s] Handshake Step 2 FAILED: Error setting read deadline for peer %s: %v", handlerID, remotePeerID, err)
+				stream.Reset()
+				return
+			}
+			reader := bufio.NewReader(stream) // Buffered reader for handshake line
 			remoteIPStr, err := reader.ReadString('\n')
+			// Reset deadline immediately
+			if errReset := stream.SetReadDeadline(time.Time{}); errReset != nil {
+				log.Printf("[%s] Handshake Warning: Failed resetting read deadline for peer %s: %v", handlerID, remotePeerID, errReset)
+			}
+			// Check read error
 			if err != nil {
-				log.Printf("Error reading IP from peer %s: %v", remotePeerID, err)
+				// Check if the error is due to the overall handler context timeout
+				if handlerHandshakeCtx.Err() == context.DeadlineExceeded {
+					log.Printf("[%s] Handshake Step 2 FAILED: Overall handshake timeout reading IP from peer %s", handlerID, remotePeerID)
+				} else {
+					log.Printf("[%s] Handshake Step 2 FAILED: Error reading IP from peer %s: %v", handlerID, remotePeerID, err)
+				}
 				stream.Reset()
 				return
 			}
 			remoteIPStr = strings.TrimSpace(remoteIPStr)
-			log.Printf("Received IP %s from %s", remoteIPStr, remotePeerID)
+			log.Printf("[%s] Handshake Step 2 SUCCESS: Received IP %s from %s", handlerID, remoteIPStr, remotePeerID)
 
 			// 3. Update routing table
+			log.Printf("[%s] Handshake Step 3: Updating routing table %s -> %s", handlerID, remoteIPStr, remotePeerID)
 			routingTableLock.Lock()
 			peerRoutingTable[remoteIPStr] = remotePeerID
 			routingTableLock.Unlock()
-			log.Printf("Updated routing table: %s -> %s", remoteIPStr, remotePeerID)
+			log.Printf("[%s] Handshake Step 3 SUCCESS: Updated routing table: %s -> %s", handlerID, remoteIPStr, remotePeerID)
+
+			// --- Handshake Complete ---
+			log.Printf("[%s] Handshake COMPLETE for incoming stream from %s. Entering packet read loop.", handlerID, remotePeerID)
 
 			// 4. Now handle packet forwarding from this peer
 			buf := make([]byte, 2000) // MTU size buffer
 			for {
-				n, err := stream.Read(buf) // Use the stream directly now
+				// Check context before blocking read
+				select {
+				case <-handlerHandshakeCtx.Done(): // Reuse handshake context for overall stream lifetime? Maybe not ideal. Let's remove this check for now.
+					// log.Printf("[%s] Stream handler context done for peer %s. Exiting read loop.", handlerID, remotePeerID)
+					// return
+				default:
+					// Context is still active, proceed with read
+				}
+
+				// Log before blocking on Read
+				log.Printf("[%s] Waiting to read next packet from peer %s (Stream ID: %s)...", handlerID, remotePeerID, stream.ID())
+				// Set a read deadline for packet reading? Could be useful to detect dead streams.
+				// Let's add a longer deadline for regular packet reads.
+				packetReadDeadline := time.Now().Add(2 * time.Minute) // Example: 2 minutes idle timeout
+				if err := stream.SetReadDeadline(packetReadDeadline); err != nil {
+					log.Printf("[%s] Error setting packet read deadline for peer %s: %v. Continuing without deadline.", handlerID, remotePeerID, err)
+					// Don't reset the stream here, just log and continue
+					stream.SetReadDeadline(time.Time{}) // Attempt to clear deadline
+				}
+
+				n, err := stream.Read(buf) // Use the stream directly now (no longer using buffered reader)
+
+				// Clear deadline after read attempt
+				if errClear := stream.SetReadDeadline(time.Time{}); errClear != nil {
+					log.Printf("[%s] Warning: Failed to clear packet read deadline for peer %s: %v", handlerID, remotePeerID, errClear)
+				}
+
 				if err != nil {
+					// Check for timeout error specifically
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+						log.Printf("[%s] Read timeout from peer %s (Stream ID: %s). Assuming idle, continuing read loop.", handlerID, remotePeerID, stream.ID())
+						// Don't return, just continue waiting for the next packet
+						continue
+					}
+
 					// More specific logging for common errors
-					if err == network.ErrReset {
-						log.Printf("Stream reset by peer %s", remotePeerID)
+					if err == network.ErrReset || strings.Contains(err.Error(), "stream reset") { // Check string for robustness
+						log.Printf("[%s] Stream reset by peer %s (Stream ID: %s)", handlerID, remotePeerID, stream.ID())
 					} else if err == context.Canceled || err == context.DeadlineExceeded {
-						log.Printf("Stream context error for peer %s: %v", remotePeerID, err)
+						log.Printf("[%s] Stream context error for peer %s (Stream ID: %s): %v", handlerID, remotePeerID, stream.ID(), err)
+					} else if err.Error() == "EOF" {
+						log.Printf("[%s] Stream closed by peer %s (EOF) (Stream ID: %s)", handlerID, remotePeerID, stream.ID())
 					} else {
-						log.Printf("Stream read error from peer %s: %v", remotePeerID, err)
+						log.Printf("[%s] Stream read error from peer %s (Stream ID: %s): %v", handlerID, remotePeerID, stream.ID(), err)
 					}
 					// Error automatically leads to defer cleanup
 					return // Exit goroutine on error
 				}
 
 				if n == 0 { // Should not happen with TCP streams, but check anyway
-					log.Printf("Read 0 bytes from peer %s, continuing", remotePeerID)
+					log.Printf("[%s] Read 0 bytes from peer %s (Stream ID: %s), continuing", handlerID, remotePeerID, stream.ID())
 					continue
 				}
 
 				// Basic check: Ensure packet has at least an IPv4 header (20 bytes)
 				if n < 20 {
-					log.Printf("Received runt packet from %s, size %d, discarding", remotePeerID, n)
+					log.Printf("[%s] Received runt packet from %s (Stream ID: %s), size %d, discarding", handlerID, remotePeerID, stream.ID(), n)
 					continue
 				}
 
 				// Log packet reception from peer before writing to TUN
 				destIP := net.IP(buf[16:20]) // Peek at destination IP for logging
-				log.Printf("Read %d bytes from peer %s (Stream ID: %s) for dest %s. Writing to TUN.", n, remotePeerID, stream.ID(), destIP.String())
+				log.Printf("[%s] Read %d bytes from peer %s (Stream ID: %s) for dest %s. Writing to TUN.", handlerID, n, remotePeerID, stream.ID(), destIP.String())
 
 				// Write packet received from peer to the local TUN interface
 				_, writeErr := tunIface.Write(buf[:n])
 				if writeErr != nil {
-					log.Printf("Error writing %d bytes to TUN from peer %s: %v", n, remotePeerID, writeErr)
+					log.Printf("[%s] Error writing %d bytes to TUN from peer %s (Stream ID: %s): %v", handlerID, n, remotePeerID, stream.ID(), writeErr)
 					// Consider if TUN write error should close the stream? For now, continue.
 				} else {
-					// log.Printf("Successfully wrote %d bytes from peer %s to TUN", n, remotePeerID) // Optional success log
+					// log.Printf("[%s] Successfully wrote %d bytes from peer %s (Stream ID: %s) to TUN", handlerID, n, remotePeerID, stream.ID()) // Optional success log
 				}
 			}
 		}(s) // Pass the stream to the goroutine
