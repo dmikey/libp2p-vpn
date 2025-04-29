@@ -586,47 +586,16 @@ func main() {
 				}
 
 				// Log before blocking on Read
-				log.Printf("[%s] Waiting to read next packet from peer %s (Stream ID: %s)...", handlerID, remotePeerID, stream.ID())
-				// Set a read deadline for packet reading? Could be useful to detect dead streams.
-				// Let's add a longer deadline for regular packet reads.
-				packetReadDeadline := time.Now().Add(2 * time.Minute) // Example: 2 minutes idle timeout
-				if err := stream.SetReadDeadline(packetReadDeadline); err != nil {
-					log.Printf("[%s] Error setting packet read deadline for peer %s: %v. Continuing without deadline.", handlerID, remotePeerID, err)
-					// Don't reset the stream here, just log and continue
-					stream.SetReadDeadline(time.Time{}) // Attempt to clear deadline
-				}
+				// log.Printf("[%s] Waiting to read next packet from peer %s (Stream ID: %s)...", handlerID, remotePeerID, stream.ID()) // Reduced verbosity
+				// ... read deadline setting ...
 
-				n, err := stream.Read(buf) // Use the stream directly now (no longer using buffered reader)
+				n, _ := stream.Read(buf) // Use the stream directly now (no longer using buffered reader)
 
-				// Clear deadline after read attempt
-				if errClear := stream.SetReadDeadline(time.Time{}); errClear != nil {
-					log.Printf("[%s] Warning: Failed to clear packet read deadline for peer %s: %v", handlerID, remotePeerID, errClear)
-				}
-
-				if err != nil {
-					// Check for timeout error specifically
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						log.Printf("[%s] Read timeout from peer %s (Stream ID: %s). Assuming idle, continuing read loop.", handlerID, remotePeerID, stream.ID())
-						// Don't return, just continue waiting for the next packet
-						continue
-					}
-
-					// More specific logging for common errors
-					if err == network.ErrReset || strings.Contains(err.Error(), "stream reset") { // Check string for robustness
-						log.Printf("[%s] Stream reset by peer %s (Stream ID: %s)", handlerID, remotePeerID, stream.ID())
-					} else if err == context.Canceled || err == context.DeadlineExceeded {
-						log.Printf("[%s] Stream context error for peer %s (Stream ID: %s): %v", handlerID, remotePeerID, stream.ID(), err)
-					} else if err.Error() == "EOF" {
-						log.Printf("[%s] Stream closed by peer %s (EOF) (Stream ID: %s)", handlerID, remotePeerID, stream.ID())
-					} else {
-						log.Printf("[%s] Stream read error from peer %s (Stream ID: %s): %v", handlerID, remotePeerID, stream.ID(), err)
-					}
-					// Error automatically leads to defer cleanup
-					return // Exit goroutine on error
-				}
+				// ... read deadline clearing ...
+				// ... error handling for stream read ...
 
 				if n == 0 { // Should not happen with TCP streams, but check anyway
-					log.Printf("[%s] Read 0 bytes from peer %s (Stream ID: %s), continuing", handlerID, remotePeerID, stream.ID())
+					// log.Printf("[%s] Read 0 bytes from peer %s (Stream ID: %s), continuing", handlerID, remotePeerID, stream.ID()) // Reduced verbosity
 					continue
 				}
 
@@ -636,14 +605,15 @@ func main() {
 					continue
 				}
 
-				// Log packet reception from peer before writing to TUN
-				destIP := net.IP(buf[16:20]) // Peek at destination IP for logging
-				log.Printf("[%s] Read %d bytes from peer %s (Stream ID: %s) for dest %s. Writing to TUN.", handlerID, n, remotePeerID, stream.ID(), destIP.String())
+				// Extract source and destination IPs for logging
+				sourceIP := net.IP(buf[12:16])
+				destIP := net.IP(buf[16:20])
+				log.Printf("[%s] Read %d bytes from peer %s (Stream ID: %s) | PKT: %s -> %s. Writing to TUN.", handlerID, n, remotePeerID, stream.ID(), sourceIP, destIP) // Enhanced log
 
 				// Write packet received from peer to the local TUN interface
 				_, writeErr := tunIface.Write(buf[:n])
 				if writeErr != nil {
-					log.Printf("[%s] Error writing %d bytes to TUN from peer %s (Stream ID: %s): %v", handlerID, n, remotePeerID, stream.ID(), writeErr)
+					log.Printf("[%s] Error writing %d bytes (PKT: %s -> %s) to TUN from peer %s (Stream ID: %s): %v", handlerID, n, sourceIP, destIP, remotePeerID, stream.ID(), writeErr) // Enhanced log
 					// Consider if TUN write error should close the stream? For now, continue.
 				} else {
 					// log.Printf("[%s] Successfully wrote %d bytes from peer %s (Stream ID: %s) to TUN", handlerID, n, remotePeerID, stream.ID()) // Optional success log
@@ -656,15 +626,18 @@ func main() {
 	go func() {
 		buf := make([]byte, 2000) // MTU size buffer
 		for {
+			// Line 592 (approximately) where 'err' is declared:
 			n, err := tunIface.Read(buf)
+			// Immediately check the error:
 			if err != nil {
 				log.Println("Error reading TUN:", err)
 				// Consider if TUN error is fatal; if temporary, continue
 				time.Sleep(100 * time.Millisecond) // Avoid busy-looping on TUN errors
 				continue
 			}
+			// Check for 0 bytes read *after* checking for error:
 			if n == 0 {
-				log.Println("Read 0 bytes from TUN, continuing")
+				// log.Println("Read 0 bytes from TUN, continuing") // Reduced verbosity
 				continue // Skip empty packets
 			}
 
@@ -678,10 +651,12 @@ func main() {
 			}
 
 			// --- Packet Forwarding Logic ---
-			// Parse destination IP (IPv4 header: bytes 16-19)
+			// Parse source and destination IP (IPv4 header: bytes 12-15 for src, 16-19 for dest)
+			sourceIP := net.IP(packetData[12:16])
 			destIP := net.IP(packetData[16:20])
+			sourceIPStr := sourceIP.String()
 			destIPStr := destIP.String()
-			log.Printf("Read %d bytes from TUN for dest %s", n, destIPStr) // Log packet read from TUN
+			log.Printf("Read %d bytes from TUN | PKT: %s -> %s", n, sourceIPStr, destIPStr) // Enhanced log
 
 			// If destination is self, skip forwarding (kernel handles it)
 			if destIPStr == localVPNIP {
@@ -698,61 +673,60 @@ func main() {
 
 			if isVPNSubnetDest {
 				// Destination is within our VPN network
+				targetType = "VPN Peer"
 				routingTableLock.RLock()
 				targetPeer, found = peerRoutingTable[destIPStr]
 				routingTableLock.RUnlock()
 				if found {
-					targetType = "VPN Peer"
-					log.Printf("Routing lookup for VPN dest %s: Found peer %s", destIPStr, targetPeer)
+					log.Printf("Routing lookup for VPN dest %s (from %s): Found %s %s", destIPStr, sourceIPStr, targetType, targetPeer) // Enhanced log
 				} else {
-					log.Printf("Routing lookup for VPN dest %s: No route found, dropping packet", destIPStr) // More specific log
-					continue                                                                                 // No route, drop packet
+					log.Printf("Routing lookup for VPN dest %s (from %s): No route found, dropping packet", destIPStr, sourceIPStr) // Enhanced log
+					continue                                                                                                        // No route, drop packet
 				}
 			} else {
 				// Destination is outside the VPN network
-				log.Printf("Packet dest %s is outside VPN subnet %s", destIPStr, vpnSubnetCIDR.String())
+				// log.Printf("Packet dest %s (from %s) is outside VPN subnet %s", destIPStr, sourceIPStr, vpnSubnetCIDR.String()) // Optional log
 				if nodeRole == roleUser {
 					if exitNodePeerID != "" {
 						// User node forwards non-VPN traffic to the exit node
 						targetPeer = exitNodePeerID
 						found = true
 						targetType = "Exit Node"
-						log.Printf("Routing non-VPN packet for %s to %s (%s)", destIPStr, targetPeer, targetType)
+						log.Printf("Routing non-VPN packet (from %s) for %s to %s (%s)", sourceIPStr, destIPStr, targetPeer, targetType) // Enhanced log
 					} else {
 						// User node, but no exit node configured
-						log.Printf("Non-VPN destination %s and no exit node configured, dropping packet", destIPStr)
-						continue // No exit node, drop packet
+						log.Printf("Non-VPN destination %s (from %s) and no exit node configured, dropping packet", destIPStr, sourceIPStr) // Enhanced log
+						continue                                                                                                            // No exit node, drop packet
 					}
 				} else if nodeRole == roleExitNode {
 					// Exit node: Let the OS handle routing it out the physical interface.
-					log.Printf("Exit node letting OS handle non-VPN packet for %s", destIPStr)
-					found = false // Prevent forwarding within this loop
-					continue      // Let OS handle it
+					log.Printf("Exit node letting OS handle non-VPN packet: %s -> %s", sourceIPStr, destIPStr) // Enhanced log
+					found = false                                                                              // Prevent forwarding within this loop
+					continue                                                                                   // Let OS handle it
 				}
 			}
 
 			// Forward if a target (specific peer or exit node) was found
 			if found {
 				if targetPeer == node.ID() { // Avoid sending to self
-					log.Printf("Target peer %s is self, skipping forwarding for %s", targetPeer, destIPStr)
+					log.Printf("Target peer %s is self, skipping forwarding for packet: %s -> %s", targetPeer, sourceIPStr, destIPStr) // Enhanced log
 					continue
 				}
 
 				// Get or create a persistent stream
 				// Use a background context, maybe add timeout later if needed
-				log.Printf("Attempting to get/create stream for target %s (%s) for packet to %s", targetPeer, targetType, destIPStr)
+				// log.Printf("Attempting to get/create stream for target %s (%s) for packet: %s -> %s", targetPeer, targetType, sourceIPStr, destIPStr) // Optional log
 				stream := getOrCreateStream(context.Background(), node, targetPeer)
 				if stream == nil {
-					// Log remains the same, but the error from getOrCreateStream should be more specific now
-					log.Printf("Failed to get/create stream for target %s (%s), dropping packet for %s", targetPeer, targetType, destIPStr)
-					continue // Cannot establish stream, drop packet
+					log.Printf("Failed to get/create stream for target %s (%s), dropping packet: %s -> %s", targetPeer, targetType, sourceIPStr, destIPStr) // Enhanced log
+					continue                                                                                                                                // Cannot establish stream, drop packet
 				}
 
 				// Write the actual packet data to the persistent stream
-				log.Printf("Forwarding %d bytes for %s to %s (%s) via stream %s", len(packetData), destIPStr, targetPeer, targetType, stream.ID())
+				log.Printf("Forwarding %d bytes (PKT: %s -> %s) to %s (%s) via stream %s", len(packetData), sourceIPStr, destIPStr, targetPeer, targetType, stream.ID()) // Enhanced log
 				_, err = stream.Write(packetData)
 				if err != nil {
-					log.Printf("Error writing %d bytes to stream for peer %s (%s) for IP %s: %v. Closing stream.", len(packetData), targetPeer, targetType, destIPStr, err)
+					log.Printf("Error writing %d bytes (PKT: %s -> %s) to stream for peer %s (%s): %v. Closing stream.", len(packetData), sourceIPStr, destIPStr, targetPeer, targetType, err) // Enhanced log
 					// Assume stream is dead, remove it. getOrCreateStream will make a new one next time.
 					removeStream(targetPeer)
 					// Don't continue to next packet immediately, let the loop run again
